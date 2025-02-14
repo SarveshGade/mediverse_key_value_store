@@ -86,6 +86,18 @@ def broadcast_write(msg, cluster, socket_locks):
         except Exception as e:
             print(e)
             return False
+        
+def broadcast_join(msg, conns, lock, socket_locks):
+    # Add the outputs from sending to replicas in a multithreaded queue
+    res = Queue()
+    
+    with lock:
+        n = len(conns)
+        
+    for i in range(n):
+        # send message to all leaders in parallel threads
+        run_thread(send_and_receive(msg, conns[i], socket_locks[i], 0, res))
+    cnts = 0
     
 
 # Initialize Hash Table service

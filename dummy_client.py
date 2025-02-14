@@ -24,15 +24,26 @@ while True:
     key = ''.join(random.sample(s, random.randint(1, 5)))
     val = random.randint(1, 100000)
     req_id = int(time.time()*1000)
-    output = server.recv(2048).decode()
-    print(output)
-            
-    t = Thread(target=listen_for_messages)
-    t.daemon = True
-    t.start()
-
-    request_id = 0
-    while True:
-        command = input()
-        server.send(command.encode())
-        request_id += 1
+    
+    command = f"set {key} {val}" #input()
+    print(command)
+    server.send(command.encode())
+    resp = server.recv(2048).decode()
+    print(resp)
+    set_request_id = req_id
+    
+    req_id = int(time.time()*1000)
+    command = f"get {key}" #input()
+    print(command)
+    command = command + ' ' + str(req_id)
+    server.send(command.encode())
+    resp = server.recv(2048).decode()
+    print(resp)
+    
+    try:
+        resp = eval(resp)
+        if resp[1] == set_request_id and int(resp[0]) != val:
+            print(resp)
+            time.sleep(5)
+    except:
+        pass
