@@ -99,6 +99,20 @@ def broadcast_join(msg, conns, lock, socket_locks):
         run_thread(send_and_receive(msg, conns[i], socket_locks[i], 0, res))
     cnts = 0
     
+    while True:
+        try:
+            out = res.get(block=True)
+            if out and out == 'ok':
+                cnts += 1
+                # All leaders received the join request
+                if cnts == n:
+                    True
+            else:
+                return False
+        except Exception as e:
+            print(e)
+            return False
+    
 
 # Initialize Hash Table service
 class HashTableService:
@@ -110,6 +124,7 @@ class HashTableService:
         self.conns = [[None]*len(self.partitions[i]) for i in range(len(self.partitions))]
         self.is_leader = False
         self.cluster_index = -1
+        self.cluster_lock = Lock()
         self.socket_locks = [[Lock() for j in range(len(self.partitions[i]))] for i in range(len(self.partitions))]
         
         for i in range(len(self.partitions)):
@@ -126,17 +141,48 @@ class HashTableService:
                 else:
                     # 3rd element is the socket object
                     self.conns[i][j] = [ip, port, None]
+        run_thread(fn=self.join_replica, args=())
                     
         print("Ready...")
 
-        
-        
+    def join_replica(self):
+        # Replic asks leaders to add itself
+        if self.is_leader is False:
+            # send message to all leaders beacuse during 'get' some leader other than own leader
+            msg = f"join {self.ip} {self.port} {self.cluster_index}"
+            resp = broadcast_join(msg, self.conns, self.cluster_lock, self.socket_locks)
+    
+            assert resp == True
     
     # handle commands that write to the table
     def handle_commands(self, msg, conn):
         # regex that receives setter and getter
         set_ht = re.match('^set ([a-zA-Z0-9]+) ([a-zA-Z0-9]+) ([0-9]+)$', msg)
         get_ht = re.match('^get ([a-zA-Z0-9]+) ([0-9]+)$', msg)
+        replica_join = re.match('^join ([0-9\.]+) ([0-9]+) ([0-9]+)$', msg)
+        
+        if replica_join:
+            # Add new replica if not already applied
+            ip, port, index = replica_join.groups()
+            ip_str = f"{ip}:{port}"
+            index = int(index)
+            
+            with self.cluster_lock:
+                # Add new replica if it is leader and not already added
+                if self.is_leader and index < len(self.partitions) and ip_str not in self.partitions:
+                    port = int(port)
+                    self.partitions[index].append(ip_str)
+                    self.conns[index].append([ip, port, None])
+                    self.socket_locks[index].append(Lock())
+                    output = "ok"
+                    
+                else:
+                    if index >= len(self.partitions):
+                        output = "ko"
+                    else:
+                        output = "ok"
+        else:
+            output = "Error: Invalid command"
         
         if set_ht:
             n = len(self.partitions)
@@ -185,6 +231,8 @@ class HashTableService:
             output = 'Error: Invalid command!'
         
         return output
+    
+
     
     def process_request(self, conn):
         while True:
