@@ -5,6 +5,9 @@ import time
 import mmh3
 from random import randint, random, shuffle
 from queue import Queue
+from pathlib import Path
+from commit_log import CommitLog
+from consistent_hashing import ConsistentHashing
 
 def run_thread(fn, args):
     my_thread = Thread(target=fn, args=args)
@@ -57,10 +60,11 @@ def send_and_receive(msg, servers, socket_locks, i, res=None, timeout=-1):
         res.put(resp)
     return resp
 
-def broadcast_write(msg, cluster, socket_locks):
+def broadcast_write(msg, cluster, lock, socket_locks):
     # Add the outputs from sending to replicas in a multithreaded queue
     res = Queue()
-    n = len(cluster)
+    with lock:
+        n = len(cluster)
     
     if n == 1:
         # No replica found
@@ -87,7 +91,7 @@ def broadcast_write(msg, cluster, socket_locks):
             print(e)
             return False
         
-def broadcast_join(msg, conns, lock, socket_locks):
+def broadcast_join(msg, conns, lock, socket_locks, exclude=None):
     # Add the outputs from sending to replicas in a multithreaded queue
     res = Queue()
     
@@ -105,8 +109,8 @@ def broadcast_join(msg, conns, lock, socket_locks):
             if out and out == 'ok':
                 cnts += 1
                 # All leaders received the join request
-                if cnts == n:
-                    True
+                if (exclude is None and cnts == n) or (exclude is not None and cnts == n-1):
+                    return True
             else:
                 return False
         except Exception as e:
@@ -125,7 +129,16 @@ class HashTableService:
         self.is_leader = False
         self.cluster_index = -1
         self.cluster_lock = Lock()
+        self.commit_log = CommitLog(file=f"commit-log-{self.ip}-{self.port}.txt")
+        self.chash = ConsistentHashing()
         self.socket_locks = [[Lock() for j in range(len(self.partitions[i]))] for i in range(len(self.partitions))]
+        self.commit_temp = {}
+        self.commit_temp_lock = Lock()
+
+        
+        commit_logfile = Path(self.commit_log.file)
+        commit_logfile.touch(exist_ok=True)
+        
         
         for i in range(len(self.partitions)):
             cluster = self.partitions[i]
@@ -142,24 +155,138 @@ class HashTableService:
                     # 3rd element is the socket object
                     self.conns[i][j] = [ip, port, None]
         run_thread(fn=self.join_replica, args=())
+        run_thread(fn=self.join_cluster, args=())
                     
         print("Ready...")
+    
+    def consistent_hash_join(self):
+        # Add leader nodes to consistent hashing
+        for i in range(len(self.partitions)):
+            added = self.chash.add_node_hash(str(i))
+            assert added == 1
 
     def join_replica(self):
-        # Replic asks leaders to add itself
+        # Replica asks leaders to add itself
         if self.is_leader is False:
-            # send message to all leaders beacuse during 'get' some leader other than own leader
+            # send message to all leaders because during 'get' some leader other than own leader
+            # might need to forward request to this replica
             msg = f"join {self.ip} {self.port} {self.cluster_index}"
             resp = broadcast_join(msg, self.conns, self.cluster_lock, self.socket_locks)
     
             assert resp == True
-    
+            
+            self.commit_log.truncate()
+            
+            # Get commitlog from own leader and update own ht
+            # Wait for own leader to be ready
+            while True:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.connect((str(self.conns[self.cluster_index][0][0]),
+                                  int(self.conns[self.cluster_index][0][1])))
+                    self.commit_log.write_log_from_sock(sock)
+                    sock.close()
+                    break
+                except Exception as e:
+                    print(e)
+                    time.sleep(0.5)
+            # Get commands in memory from log file and insert into own ht
+            commands = self.commit_log.read_log()
+            for cmd in commands:
+                parts = cmd.split(" ")
+                if len(parts) == 4:
+                    # set operation
+                    op, key, value, req_id = parts
+                else:
+                    # delete operations
+                    op, key, req_id = parts
+                req_id = int(req_id)
+                if op == 'set':
+                    self.ht.set(key=key, value=value, req_id=req_id)
+                else:
+                    self.ht.delete(key=key, req_id=req_id)
+
+                    
+    def join_cluster(self):
+        # Leader asks other leaders to add itself
+        if self.is_leader:
+            # Send message to all leaders other than itself
+            msg = f"join {self.ip} {self.port} {self.cluster_index}"
+            resp = broadcast_join(msg, self.conns, self.cluster_lock, self.socket_locks, self.cluster_index)
+            assert resp == True
+            
+            # Get all next nodes in consistent hash ring. Some keys that were mapped to these nodes
+            # will now be mapped to this new leader node.
+            nodes = self.chash.get_next_nodes_from_node(str(self.cluster_index))
+            
+            for next_node in nodes:
+                next_node = int(next_node)
+                
+                self.commit_log_temp = CommitLog(f"commit-log-temp-{self.ip}-{self.port}.txt")
+                
+                commit_logfile = Path(self.commit_log_temp.file)
+                commit_logfile.touch(exist_ok=True)
+                
+                # Get commitlog from leader and update own ht
+                while True:
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        sock.connect((str(self.conns[next_node][0][0]), 
+                                    int(self.conns[next_node][0][1])))
+                        
+                        self.commit_log_temp.write_log_from_sock(sock)
+                        sock.close()
+                        break
+                    except Exception as e:
+                        print(e)
+                        time.sleep(0.5)
+                
+                # Update commit log with only those keys for which are before current node
+                # in the consistent hash ring and not all keys.
+                # Create temp log file for these.
+                commands = self.commit_log_temp.read_log()
+                
+                for cmd in commands:
+                    parts = cmd.split(" ")
+                    if len(parts) == 4:
+                        # set operation
+                        op, key, value, req_id = parts
+                    else:
+                        # delete operations
+                        op, key, req_id = parts
+                        
+                    nxt = int(self.chash.get_next_node(key))
+                    
+                    if nxt == self.cluster_index:
+                        req_id = int(req_id)
+                        if op == 'set':
+                            ret = self.ht.set(key=key, value=value, req_id=req_id)
+                        else:
+                            ret = self.ht.delete(key=key, req_id=req_id)
+                        
+                        if ret == 1:
+                            self.commit_log.log(cmd)
+                        
+                        # send delete message for moved keys
+                        msg = f"del-no-fwd {key} {req_id}"
+                        resp = send_and_receive(msg, self.conns[next_node], self.socket_locks[next_node], 0)
+                        assert resp == "ok"
+                
+                os.remove(self.commit_log_temp.file)            
+
     # handle commands that write to the table
     def handle_commands(self, msg, conn):
         # regex that receives setter and getter
         set_ht = re.match('^set ([a-zA-Z0-9]+) ([a-zA-Z0-9]+) ([0-9]+)$', msg)
         get_ht = re.match('^get ([a-zA-Z0-9]+) ([0-9]+)$', msg)
+        del_ht = re.match('^del ([a-zA-Z0-9]+) ([0-9]+)$', msg)
+        del_ht_no_fwd = re.match('^del-no-fwd ([a-zA-Z0-9]+) ([0-9]+)$', msg)
         replica_join = re.match('^join ([0-9\.]+) ([0-9]+) ([0-9]+)$', msg)
+        committxn = re.match('^committxn ([a-zA-Z\-]+) ([a-zA-Z0-9]+) ([0-9]+)$', msg)
+        
+        log = re.match('^commitlog$', msg)
         
         if replica_join:
             # Add new replica if not already applied
@@ -196,6 +323,8 @@ class HashTableService:
                     replicated = broadcast_write(msg, self.conns[node], self.socket_locks[node])
                     if replicated:
                         ret = self.ht.set(key=key, value=value, req_id=req_id)
+                        if ret == 1:
+                            self.commit_log.log(msg)
                         output = "ok"
                     else:
                         output= "ko"
@@ -227,6 +356,11 @@ class HashTableService:
                         break
             if output is None:
                 output = 'Error: Non existent key'
+        elif log:
+                # send commit log file
+                self.commit_log.send_log_to_sock(conn)
+                output = ""
+                conn.close()
         else:
             output = 'Error: Invalid command!'
         
