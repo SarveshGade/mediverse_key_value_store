@@ -28,6 +28,8 @@ def send_and_receive(msg, servers, socket_locks, i, res=None, timeout=-1):
     # 1. Server is not ready
     # 2. Server is busy
     # 3. Server crashed
+    
+    
     while True:
         try:
             if servers[i][2] is None:
@@ -50,12 +52,11 @@ def send_and_receive(msg, servers, socket_locks, i, res=None, timeout=-1):
                 break
         except Exception as e:
             print(e)
-            # if server ceashes but isn't marked
+            # if server crashes but isn't marked
             if servers[i][2] is not None:
-                try:
-                    servers[i][2].close()
-                except:
-                    pass
+                sock = servers[i][2]
+                sock.close()
+                
                 servers[i][2] = None
 
             time.sleep(0.5)
@@ -283,9 +284,9 @@ class HashTableService:
     # handle commands that write to the table
     def handle_commands(self, msg, conn):
         # regex that receives setter and getter
-        set_ht = re.match('^set ([a-zA-Z0-9]+) ([a-zA-Z0-9]+) ([0-9]+)$', msg)
-        get_ht = re.match('^get ([a-zA-Z0-9]+) ([0-9]+)$', msg)
-        del_ht = re.match('^del ([a-zA-Z0-9]+) ([0-9]+)$', msg)
+        set_ht = re.match('^set ([a-zA-Z0-9:]+) ([a-zA-Z0-9]+) ([0-9]+)$', msg)
+        get_ht = re.match('^get ([a-zA-Z0-9:]+) ([0-9]+)$', msg)
+        del_ht = re.match('^del ([a-zA-Z0-9:]+) ([0-9]+)$', msg)
         del_ht_no_fwd = re.match('^del-no-fwd ([a-zA-Z0-9]+) ([0-9]+)$', msg)
         replica_join = re.match('^join ([0-9\.]+) ([0-9]+) ([0-9]+)$', msg)
         committxn = re.match('^committxn ([a-zA-Z\-]+) ([a-zA-Z0-9]+) ([0-9]+)$', msg)
