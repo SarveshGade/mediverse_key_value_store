@@ -19,7 +19,7 @@ class CommitLog:
                 message = now + "," + command
                 f.write(f"{message}\n")
                 
-    def read_log(self, command, sep=' '):
+    def read_log(self, sep=' '):
         with self.lock:
             output = []
             with open(self.file, 'r') as f:

@@ -52,9 +52,12 @@ def send_and_receive(msg, servers, socket_locks, i, res=None, timeout=-1):
             print(e)
             # if server ceashes but isn't marked
             if servers[i][2] is not None:
-                sock = servers[i][2]
-                sock.close()
+                try:
+                    servers[i][2].close()
+                except:
+                    pass
                 servers[i][2] = None
+
             time.sleep(0.5)
     if res is not None:
         res.put(resp)
@@ -100,7 +103,7 @@ def broadcast_join(msg, conns, lock, socket_locks, exclude=None):
         
     for i in range(n):
         # send message to all leaders in parallel threads
-        run_thread(send_and_receive(msg, conns[i], socket_locks[i], 0, res))
+        run_thread(send_and_receive, args=(msg, conns[i], socket_locks[i], 0, res))
     cnts = 0
     
     while True:
@@ -154,6 +157,7 @@ class HashTableService:
                 else:
                     # 3rd element is the socket object
                     self.conns[i][j] = [ip, port, None]
+        self.consistent_hash_join()
         run_thread(fn=self.join_replica, args=())
         run_thread(fn=self.join_cluster, args=())
                     
@@ -288,81 +292,249 @@ class HashTableService:
         
         log = re.match('^commitlog$', msg)
         
-        if replica_join:
-            # Add new replica if not already applied
-            ip, port, index = replica_join.groups()
-            ip_str = f"{ip}:{port}"
-            index = int(index)
+        if set_ht:
+            output = "ko"
             
-            with self.cluster_lock:
-                # Add new replica if it is leader and not already added
-                if self.is_leader and index < len(self.partitions) and ip_str not in self.partitions:
-                    port = int(port)
-                    self.partitions[index].append(ip_str)
-                    self.conns[index].append([ip, port, None])
-                    self.socket_locks[index].append(Lock())
+            try:
+                key, value, req_id = set_ht.groups()
+                req_id = int(req_id)
+                node = int(self.chash.get_next_node(key))
+                
+                if self.cluster_index == node:
+                    # The key is intended for current cluster
+                    
+                    # Prevent reading key while it is being updated and replicated
+                    with self.commit_temp_lock:
+                        if key not in self.commit_temp:
+                            self.commit_temp[key] = {}
+                        
+                        # Same key might come in for multiple req_id's
+                        self.commit_temp[key][req_id] = value
+                    
+                    if self.is_leader:
+                        # Replicate if this is leader server and req_id is the latest one corresponding to key
+                        replicated = broadcast_write(msg, self.conns[node], self.cluster_lock, self.socket_locks[node])
+                        
+                        if replicated:
+                            commited = broadcast_write(f"committxn set {key} {req_id}", self.conns[node], self.cluster_lock, self.socket_locks[node])
+                            
+                            if commited:
+                                ret = self.ht.set(key=key, value=value, req_id=req_id)
+                                if ret == 1:
+                                    self.commit_log.log(msg)
+                                
+                                # req_id commit is completed
+                                self.commit_temp[key].pop(req_id)
+                                output = "ok"
+                    else:
+                        output = "ok"
+                else:
+                    # Forward to relevant cluster if key is not intended for this cluster
+                    output = send_and_receive(msg, self.conns[node], self.socket_locks[node], 0)
+                    if output is None:
+                        output = "ko"
+                        
+            except Exception as e:
+                print(e)
+   
+        elif get_ht:
+            output = "ko"
+            
+            try:
+                key, _ = get_ht.groups()
+                node = int(self.chash.get_next_node(key))
+                
+                if self.cluster_index == node:
+                    # The key is intended for current cluster
+                    
+                    while True:
+                        # Key is being updated and replicated
+                        if key not in self.commit_temp or len(self.commit_temp[key]) == 0:
+                            break
+                        
+                        # retry if update is not yet commited
+                        time.sleep(0.5)
+                        
+                    output = self.ht.get(key=key)
+                    if output:
+                        output = str(output)
+                        
+                else:
+                    # Forward the get request to a random node in the correct cluster
+                    with self.cluster_lock:
+                        indices = list(range(len(self.partitions[node])))
+                    
+                    shuffle(indices)
+                    # Loop over multiple indices because some replica might be unresponsive and times out
+                    for j in indices:
+                        output = send_and_receive(msg, self.conns[node], self.socket_locks[node], j, timeout=10)
+                        if output:
+                            break
+                    
+                if output is None:
+                    output = 'Error: Non existent key'
+                    
+            except Exception as e:
+                print(e)
+        
+        elif del_ht:
+            output = "ko"
+            
+            try:
+                key, req_id = del_ht.groups()
+                req_id = int(req_id)
+                node = int(self.chash.get_next_node(key))
+                
+                if self.cluster_index == node:
+                    # The key is intended for current cluster
+                    
+                    # Prevent reading key while it is being updated and replicated
+                    with self.commit_temp_lock:
+                        if key not in self.commit_temp:
+                            self.commit_temp[key] = {}
+                        
+                        # Same key might come in for multiple req_id's
+                        self.commit_temp[key][req_id] = None
+                    
+                    if self.is_leader:
+                        # Replicate if this is leader server and req_id is the latest one corresponding to key
+                        replicated = broadcast_write(msg, self.conns[node], self.cluster_lock, self.socket_locks[node])
+                        
+                        if replicated:
+                            commited = broadcast_write(f"committxn del {key} {req_id}", self.conns[node], self.cluster_lock, self.socket_locks[node])
+                            if commited:
+                                ret = self.ht.delete(key=key, req_id=req_id)
+                                if ret == 1:
+                                    self.commit_log.log(msg)
+                                
+                                # req_id commit is completed
+                                self.commit_temp[key].pop(req_id)
+                                output = "ok"
+                    else:
+                        output = "ok"
+                else:
+                    # Forward to relevant cluster if key is not intended for this cluster
+                    output = send_and_receive(msg, self.conns[node], self.socket_locks[node], 0)
+                    if output is None:
+                        output = "ko"
+                        
+            except Exception as e:
+                print(e)
+        
+        elif del_ht_no_fwd:
+            output = "ko"
+            
+            try:
+                key, req_id = del_ht_no_fwd.groups()
+                req_id = int(req_id)
+                
+                # Prevent reading key while it is being updated and replicated
+                with self.commit_temp_lock:
+                    if key not in self.commit_temp:
+                        self.commit_temp[key] = {}
+                    
+                    # Same key might come in for multiple req_id's
+                    self.commit_temp[key][req_id] = None
+                
+                # The key is intended for current cluster
+                if self.is_leader:
+                    # Replicate if this is leader server and req_id is the latest one corresponding to key
+                    replicated = broadcast_write(msg, self.conns[self.cluster_index], self.cluster_lock, self.socket_locks[self.cluster_index])
+                    
+                    if replicated:
+                        commited = broadcast_write(f"committxn del-no-fwd {key} {req_id}", self.conns[self.cluster_index], self.cluster_lock, self.socket_locks[self.cluster_index])
+                        if commited:
+                            ret = self.ht.delete(key=key, req_id=req_id)
+                            if ret == 1:
+                                self.commit_log.log(msg)
+                            
+                            # req_id commit is completed
+                            self.commit_temp[key].pop(req_id)
+                            output = "ok"
+                else:
                     output = "ok"
                     
-                else:
-                    if index >= len(self.partitions):
-                        output = "ko"
-                    else:
-                        output = "ok"
-        else:
-            output = "Error: Invalid command"
+            except Exception as e:
+                print(e)
         
-        if set_ht:
-            n = len(self.partitions)
-            key, value, req_id = set_ht.groups()
-            req_id = int(req_id)
-            node = mmh3.hash(key, signed=False) % n
-            if self.cluster_index == node:
-                # the key is intended for the current cluster
-                if self.is_leader:
-                    # replicate if this is the leader server and req_id is the latest one corresponding to key
-                    replicated = broadcast_write(msg, self.conns[node], self.socket_locks[node])
-                    if replicated:
-                        ret = self.ht.set(key=key, value=value, req_id=req_id)
-                        if ret == 1:
-                            self.commit_log.log(msg)
-                        output = "ok"
-                    else:
-                        output= "ko"
-                else:
-                    ret = self.ht.set(key=key, value=value, req_id=req_id)
-                    output = "ok" 
-            else:
-                # forward to relevant cluster if key is not intended for this cluster
-                output = send_and_receive(msg, self.conns[node], self.socket_locks[node], 0)
-                if output is None:
-                    output = "ko"
-        elif get_ht:
-            n = len(self.partitions)
-            key, _= get_ht.groups()
-            node = mmh3.hash(key, signed=False) % n
+        elif replica_join:
+            # Add new replica if not already added
+            output = "ko"
             
-            if self.cluster_index == node:
-                # The key is intended for the current cluster
-                output = str(self.ht.get(key=key))
-            else:
-                # Forward the get request to a random replica in the currect cluster
-                indices = list(range(len(self.partitions[node])))
-                shuffle(indices)
+            try:
+                ip, port, index = replica_join.groups()
+                ip_str = f"{ip}:{port}"
+                index  = int(index)
                 
-                # Loop over multiple indices because some replicas may be unresponsive and thus time out
-                for j in indices:
-                    output = send_and_receive(msg, self.conns[node], self.socket_locks[node], j, timeout=10)
-                    if output:
-                        break
-            if output is None:
-                output = 'Error: Non existent key'
+                with self.cluster_lock:
+                    # Add new cluster
+                    if index >= len(self.partitions):
+                        port = int(port)
+                        self.partitions.append([ip_str])
+                        self.conns.append([[ip, port, None]])
+                        self.socket_locks.append([Lock()])
+                        self.chash.add_node_hash(str(index))
+                        output = "ok"
+                    
+                    # Add new replica if it is leader and not already added
+                    elif self.is_leader and ip_str not in self.partitions[index]:
+                        port = int(port)
+                        self.partitions[index].append(ip_str)
+                        self.conns[index].append([ip, port, None])
+                        self.socket_locks[index].append(Lock())
+                        output = "ok"
+                            
+                    else:
+                        output = "ok"
+                        
+            except Exception as e:
+                print(e)
+        
         elif log:
-                # send commit log file
+            output = "ko"
+            
+            try:
+                # Send commit log file
                 self.commit_log.send_log_to_sock(conn)
                 output = ""
                 conn.close()
+            except Exception as e:
+                print(e)
+            
+        elif committxn:
+            output = "ko"
+            
+            try:
+                op, key, req_id = committxn.groups()
+                req_id = int(req_id)
+                
+                val = self.commit_temp[key][req_id]
+                
+                if op == "set":
+                    ret = self.ht.set(key=key, value=val, req_id=req_id)
+                    if ret == 1:
+                        self.commit_log.log(f"set {key} {val} {req_id}")
+                        
+                elif op == "del":
+                    ret = self.ht.delete(key=key, req_id=req_id)
+                    if ret == 1:
+                        self.commit_log.log(f"del {key} {req_id}")
+                
+                elif op == "del-no-fwd":
+                    ret = self.ht.delete(key=key, req_id=req_id)
+                    if ret == 1:
+                        self.commit_log.log(f"del-no-fwd {key} {req_id}")
+                else:
+                    raise Exception("Invalid operator")
+                
+                self.commit_temp[key].pop(req_id)
+                output = "ok"
+                        
+            except Exception as e:
+                print(e)
+                
         else:
-            output = 'Error: Invalid command!'
+            output = "Error: Invalid command"
         
         return output
     
